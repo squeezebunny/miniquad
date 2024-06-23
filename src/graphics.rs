@@ -308,6 +308,7 @@ pub enum TextureFormat {
     Depth,
     Depth32,
     Alpha,
+    DepthStencil,
 }
 impl TextureFormat {
     /// Returns the size in bytes of texture with `dimensions`.
@@ -320,6 +321,7 @@ impl TextureFormat {
             TextureFormat::Depth => 2 * square,
             TextureFormat::Depth32 => 4 * square,
             TextureFormat::Alpha => 1 * square,
+            TextureFormat::DepthStencil => 4 * square,
         }
     }
 }
@@ -1179,13 +1181,14 @@ pub trait RenderingBackend {
         color_img: TextureId,
         depth_img: Option<TextureId>,
     ) -> RenderPass {
-        self.new_render_pass_mrt(&[color_img], depth_img)
+        self.new_render_pass_mrt(&[color_img], depth_img, false)
     }
     /// Same as "new_render_pass", but allows multiple color attachments.
     fn new_render_pass_mrt(
         &mut self,
         color_img: &[TextureId],
         depth_img: Option<TextureId>,
+        depth_stencil: bool,
     ) -> RenderPass;
     /// panics for depth-only or multiple color attachment render pass
     /// This function is, mostly, legacy. Using "render_pass_color_attachments"

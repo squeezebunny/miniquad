@@ -64,6 +64,9 @@ impl From<TextureFormat> for (GLenum, GLenum, GLenum) {
             TextureFormat::Alpha => (GL_ALPHA, GL_ALPHA, GL_UNSIGNED_BYTE),
             #[cfg(not(target_arch = "wasm32"))]
             TextureFormat::Alpha => (GL_R8, GL_RED, GL_UNSIGNED_BYTE), // texture updates will swizzle Red -> Alpha to match WASM
+            TextureFormat::DepthStencil => {
+                (GL_DEPTH24_STENCIL8, GL_DEPTH_STENCIL, GL_UNSIGNED_INT_24_8)
+            }
         }
     }
 }
@@ -146,6 +149,10 @@ impl Texture {
                 params.format.size(params.width, params.height) as usize,
                 bytes_data.len()
             );
+        }
+        if params.format == TextureFormat::DepthStencil {
+            assert_eq!(params.min_filter, FilterMode::Nearest);
+            assert_eq!(params.mag_filter, FilterMode::Nearest);
         }
 
         let (internal_format, format, pixel_type) = params.format.into();
@@ -955,6 +962,7 @@ impl RenderingBackend for GlContext {
         &mut self,
         color_img: &[TextureId],
         depth_img: Option<TextureId>,
+        depth_stencil: bool,
     ) -> RenderPass {
         if color_img.is_empty() && depth_img.is_none() {
             panic!("Render pass should have at least one non-none target");
@@ -976,7 +984,11 @@ impl RenderingBackend for GlContext {
             if let Some(depth_img) = depth_img {
                 glFramebufferTexture2D(
                     GL_FRAMEBUFFER,
-                    GL_DEPTH_ATTACHMENT,
+                    if depth_stencil {
+                        GL_STENCIL_ATTACHMENT
+                    } else {
+                        GL_DEPTH_ATTACHMENT
+                    },
                     GL_TEXTURE_2D,
                     self.textures.get(depth_img).raw,
                     0,
