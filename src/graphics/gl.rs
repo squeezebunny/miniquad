@@ -745,10 +745,6 @@ impl GlContext {
         unsafe { glColorMask(r as _, g as _, b as _, a as _) }
         self.cache.color_write = color_write;
     }
-
-    fn has_integer_attributes(&self) -> bool {
-        self.info.has_integer_attributes()
-    }
 }
 
 fn gl_info(features: Features) -> ContextInfo {
@@ -1082,6 +1078,7 @@ impl RenderingBackend for GlContext {
             name,
             format,
             buffer_index,
+            gl_pass_as_float,
         } in attributes
         {
             let buffer_data = &mut buffer_cache
@@ -1117,6 +1114,7 @@ impl RenderingBackend for GlContext {
                         stride: buffer_data.stride,
                         buffer_index: *buffer_index,
                         divisor,
+                        gl_pass_as_float: *gl_pass_as_float,
                     };
 
                     assert!(
@@ -1344,8 +1342,9 @@ impl RenderingBackend for GlContext {
                     unsafe {
                         match attribute.type_ {
                             GL_INT | GL_UNSIGNED_INT | GL_SHORT | GL_UNSIGNED_SHORT
-                            | GL_UNSIGNED_BYTE | GL_BYTE => {
-                                assert!(self.has_integer_attributes());
+                            | GL_UNSIGNED_BYTE | GL_BYTE
+                                if !attribute.gl_pass_as_float =>
+                            {
                                 glVertexAttribIPointer(
                                     attr_index as GLuint,
                                     attribute.size,

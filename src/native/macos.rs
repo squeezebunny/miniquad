@@ -12,13 +12,20 @@ use {
         },
         native_display, CursorIcon,
     },
-    std::{collections::HashMap, os::raw::c_void, sync::mpsc::Receiver},
+    std::{
+        collections::HashMap,
+        os::raw::c_void,
+        sync::mpsc::Receiver,
+        time::{Duration, Instant},
+    },
 };
 
 pub struct MacosDisplay {
     window: ObjcId,
     view: ObjcId,
+    gl_context: ObjcId,
     fullscreen: bool,
+    occluded: bool,
     // [NSCursor hide]/unhide calls should be balanced
     // hide/hide/unhide will keep cursor hidden
     // so need to keep internal cursor state to avoid problems from
@@ -34,6 +41,7 @@ pub struct MacosDisplay {
     modifiers: Modifiers,
     native_requests: Receiver<Request>,
     update_requested: bool,
+    last_paint_start_time: Instant,
 }
 
 impl MacosDisplay {
@@ -148,6 +156,11 @@ impl MacosDisplay {
 
     unsafe fn update_dimensions(&mut self) -> Option<(i32, i32)> {
         let mut d = native_display().lock().unwrap();
+        unsafe {
+            if self.gl_context != nil {
+                msg_send_![self.gl_context, update];
+            }
+        }
         if d.high_dpi {
             let dpi_scale: f64 = msg_send![self.window, backingScaleFactor];
             d.dpi_scale = dpi_scale as f32;
@@ -286,6 +299,13 @@ pub fn define_cocoa_window_delegate() -> *const Class {
         }
     }
 
+    extern "C" fn window_did_move(this: &Object, _: Sel, _: ObjcId) {
+        let payload = get_window_payload(this);
+        unsafe {
+            msg_send_![payload.gl_context, update];
+        }
+    }
+
     extern "C" fn window_did_change_screen(this: &Object, _: Sel, _: ObjcId) {
         let payload = get_window_payload(this);
         if let Some((w, h)) = unsafe { payload.update_dimensions() } {
@@ -302,6 +322,21 @@ pub fn define_cocoa_window_delegate() -> *const Class {
         let payload = get_window_payload(this);
         payload.fullscreen = false;
     }
+    extern "C" fn window_did_change_occlusion_state(this: &Object, _: Sel, _: ObjcId) {
+        unsafe {
+            let payload = get_window_payload(this);
+            let responds: bool = msg_send![payload.window, respondsToSelector:sel!(occlusionState)];
+            if responds {
+                let state: u64 = msg_send![payload.window, occlusionState];
+                if state & NSWindowOcclusionStateVisible != 0 {
+                    payload.occluded = false;
+                } else {
+                    payload.occluded = true;
+                }
+            }
+        }
+    }
+
     let superclass = class!(NSObject);
     let mut decl = ClassDecl::new("RenderWindowDelegate", superclass).unwrap();
 
@@ -317,6 +352,10 @@ pub fn define_cocoa_window_delegate() -> *const Class {
             window_did_resize as extern "C" fn(&Object, Sel, ObjcId),
         );
         decl.add_method(
+            sel!(windowDidMove:),
+            window_did_move as extern "C" fn(&Object, Sel, ObjcId),
+        );
+        decl.add_method(
             sel!(windowDidChangeScreen:),
             window_did_change_screen as extern "C" fn(&Object, Sel, ObjcId),
         );
@@ -327,6 +366,10 @@ pub fn define_cocoa_window_delegate() -> *const Class {
         decl.add_method(
             sel!(windowDidExitFullScreen:),
             window_did_exit_fullscreen as extern "C" fn(&Object, Sel, ObjcId),
+        );
+        decl.add_method(
+            sel!(windowDidChangeOcclusionState:),
+            window_did_change_occlusion_state as extern "C" fn(&Object, Sel, ObjcId),
         );
     }
     // Store internal state as user data
@@ -568,6 +611,7 @@ unsafe fn view_base_decl(decl: &mut ClassDecl) {
 
         payload.modifiers = new_modifiers;
     }
+
     decl.add_method(
         sel!(canBecomeKey),
         yes as extern "C" fn(&Object, Sel) -> BOOL,
@@ -637,15 +681,9 @@ unsafe fn view_base_decl(decl: &mut ClassDecl) {
 }
 
 pub fn define_opengl_view_class() -> *const Class {
-    //extern "C" fn dealloc(this: &Object, _sel: Sel) {}
-
     extern "C" fn reshape(this: &Object, _sel: Sel) {
         let payload = get_window_payload(this);
-
         unsafe {
-            let superclass = superclass(this);
-            let () = msg_send![super(this, superclass), reshape];
-
             if let Some((w, h)) = payload.update_dimensions() {
                 if let Some(event_handler) = payload.context() {
                     event_handler.resize_event(w as _, h as _);
@@ -654,67 +692,48 @@ pub fn define_opengl_view_class() -> *const Class {
         }
     }
 
-    extern "C" fn draw_rect(this: &Object, _sel: Sel, _rect: NSRect) {
+    extern "C" fn draw_rect(this: &Object, _sel: Sel, _: ObjcId) {
+        // For opengl draw_rect called only during resize
         let payload = get_window_payload(this);
-        let mut updated = false;
-
-        if let Some(event_handler) = payload.context() {
-            event_handler.update();
-            event_handler.draw();
-            updated = true;
-        }
-        if updated {
-            payload.update_requested = false;
-        }
-
         unsafe {
-            let ctx: ObjcId = msg_send![this, openGLContext];
-            assert!(!ctx.is_null());
-            let () = msg_send![ctx, flushBuffer];
-
-            let d = native_display().lock().unwrap();
-            if d.quit_requested || d.quit_ordered {
-                drop(d);
-                let () = msg_send![payload.window, performClose: nil];
+            // Need this update_dimensions so it sets right dpi_scale at the beggining
+            if let Some((w, h)) = payload.update_dimensions() {
+                if let Some(event_handler) = payload.context() {
+                    event_handler.resize_event(w as _, h as _);
+                }
+            }
+            let current_runloop = msg_send_![class!(NSRunLoop), currentRunLoop];
+            let current_mode: ObjcId = msg_send![current_runloop, currentMode];
+            // Not checking name, assuming that this is NSEventTrackingRunLoopMode
+            if current_mode != nil {
+                perform_redraw(payload, AppleGfxApi::OpenGl, true);
             }
         }
     }
 
-    extern "C" fn prepare_open_gl(this: &Object, _sel: Sel) {
-        let payload = get_window_payload(this);
+    // apparently, its impossible to use performSelectorOnMainThread
+    // with primitive type argument, so the only way to pass
+    // YES to setNeedsDisplay - send a no argument message
+    // https://stackoverflow.com/questions/6120614/passing-primitives-through-performselectoronmainthread
+    // It seems that the same thing applies to [NSTimer timerWithTimeInterval:...]
+    extern "C" fn set_needs_display_hack(this: &Object, _: Sel) {
         unsafe {
-            let superclass = superclass(this);
-            let () = msg_send![super(this, superclass), prepareOpenGL];
-            let mut swap_interval = 1;
-            let ctx: ObjcId = msg_send![this, openGLContext];
-            let () = msg_send![ctx,
-                               setValues:&mut swap_interval
-                               forParameter:NSOpenGLContextParameterSwapInterval];
-            let () = msg_send![ctx, makeCurrentContext];
+            msg_send_![this, setNeedsDisplay: YES];
         }
-
-        gl::load_gl_funcs(|proc| {
-            let name = std::ffi::CString::new(proc).unwrap();
-
-            unsafe { get_proc_address(name.as_ptr() as _) }
-        });
-
-        let f = payload.f.take().unwrap();
-        payload.event_handler = Some(f());
     }
 
-    let superclass = class!(NSOpenGLView);
+
+    let superclass = class!(NSView);
     let mut decl: ClassDecl = ClassDecl::new("RenderViewClass", superclass).unwrap();
     unsafe {
-        //decl.add_method(sel!(dealloc), dealloc as extern "C" fn(&Object, Sel));
-        decl.add_method(
-            sel!(prepareOpenGL),
-            prepare_open_gl as extern "C" fn(&Object, Sel),
-        );
         decl.add_method(sel!(reshape), reshape as extern "C" fn(&Object, Sel));
         decl.add_method(
             sel!(drawRect:),
-            draw_rect as extern "C" fn(&Object, Sel, NSRect),
+            draw_rect as extern "C" fn(&Object, Sel, ObjcId),
+        );
+        decl.add_method(
+            sel!(setNeedsDisplayHack),
+            set_needs_display_hack as extern "C" fn(&Object, Sel),
         );
 
         view_base_decl(&mut decl);
@@ -730,41 +749,24 @@ pub fn define_metal_view_class() -> *const Class {
     let mut decl = ClassDecl::new("RenderViewClass", superclass).unwrap();
     decl.add_ivar::<*mut c_void>("display_ptr");
 
-    extern "C" fn draw_rect(this: &Object, _sel: Sel, _rect: NSRect) {
+    extern "C" fn draw_rect(this: &Object, _sel: Sel, _: ObjcId) {
         let payload = get_window_payload(this);
-
-        if payload.event_handler.is_none() {
-            let f = payload.f.take().unwrap();
-            payload.event_handler = Some(f());
-        }
-
-        let mut updated = false;
-
-        if let Some(event_handler) = payload.context() {
-            event_handler.update();
-            event_handler.draw();
-            updated = true;
-        }
-        if updated {
-            payload.update_requested = false;
-        }
-
         unsafe {
-            let d = native_display().lock().unwrap();
-            if d.quit_requested || d.quit_ordered {
-                drop(d);
-                let () = msg_send![payload.window, performClose: nil];
+            let current_runloop = msg_send_![class!(NSRunLoop), currentRunLoop];
+            let current_mode: ObjcId = msg_send![current_runloop, currentMode];
+            // Not checking name, assuming that this is NSEventTrackingRunLoopMode
+            // For metal backend this is nil during regular draw_rect calls
+            if current_mode != nil {
+                perform_redraw(payload, AppleGfxApi::Metal, true);
             }
         }
     }
 
     unsafe {
-        //decl.add_method(sel!(dealloc), dealloc as extern "C" fn(&Object, Sel));
         decl.add_method(
             sel!(drawRect:),
-            draw_rect as extern "C" fn(&Object, Sel, NSRect),
+            draw_rect as extern "C" fn(&Object, Sel, ObjcId),
         );
-
         view_base_decl(&mut decl);
     }
 
@@ -778,7 +780,7 @@ fn get_window_payload(this: &Object) -> &mut MacosDisplay {
     }
 }
 
-unsafe fn create_metal_view(_: NSRect, sample_count: i32, _: bool) -> ObjcId {
+unsafe fn create_metal_view(_: &mut MacosDisplay, sample_count: i32, _: bool) -> ObjcId {
     let mtl_device_obj = MTLCreateSystemDefaultDevice();
     let view_class = define_metal_view_class();
     let view: ObjcId = msg_send![view_class, alloc];
@@ -791,13 +793,16 @@ unsafe fn create_metal_view(_: NSRect, sample_count: i32, _: bool) -> ObjcId {
         setDepthStencilPixelFormat: MTLPixelFormat::Depth32Float_Stencil8
     ];
     let () = msg_send![view, setSampleCount: sample_count];
-    let () = msg_send![view, setEnableSetNeedsDisplay: true];
     let () = msg_send![view, setPaused: true];
 
     view
 }
 
-unsafe fn create_opengl_view(window_frame: NSRect, sample_count: i32, high_dpi: bool) -> ObjcId {
+unsafe fn create_opengl_view(
+    display: &mut MacosDisplay,
+    sample_count: i32,
+    high_dpi: bool,
+) -> ObjcId {
     use NSOpenGLPixelFormatAttribute::*;
 
     let mut attrs: Vec<u32> = vec![];
@@ -826,18 +831,22 @@ unsafe fn create_opengl_view(window_frame: NSRect, sample_count: i32, high_dpi: 
     }
     attrs.push(0);
 
-    let glpixelformat_obj: ObjcId = msg_send![class!(NSOpenGLPixelFormat), alloc];
-    let glpixelformat_obj: ObjcId =
-        msg_send![glpixelformat_obj, initWithAttributes: attrs.as_ptr()];
+    let glpixelformat_obj = msg_send_![class!(NSOpenGLPixelFormat), alloc];
+    let glpixelformat_obj = msg_send_![glpixelformat_obj, initWithAttributes: attrs.as_ptr()];
     assert!(!glpixelformat_obj.is_null());
 
     let view_class = define_opengl_view_class();
     let view: ObjcId = msg_send![view_class, alloc];
-    let view: ObjcId = msg_send![
-        view,
-        initWithFrame: window_frame
-        pixelFormat: glpixelformat_obj
-    ];
+    let view: ObjcId = msg_send![view, init];
+
+    let gl_context = msg_send_![class!(NSOpenGLContext), alloc];
+
+    display.gl_context = msg_send![gl_context, initWithFormat: glpixelformat_obj shareContext: nil];
+
+    let mut swap_interval = 1;
+    let () = msg_send![display.gl_context,
+                setValues:&mut swap_interval
+                forParameter:NSOpenGLContextParameterSwapInterval];
 
     if high_dpi {
         let () = msg_send![view, setWantsBestResolutionOpenGLSurface: YES];
@@ -901,6 +910,97 @@ unsafe fn set_icon(ns_app: ObjcId, icon: &Icon) {
     CGImageRelease(image);
 }
 
+/// Initialize the system menu bar for this application
+/// - ns_app: This NSApplication
+unsafe fn initialize_menu_bar(ns_app: ObjcId) {
+    // Adapted from Winit `menu::initialize`
+
+    // System menu bar
+    let menu_bar = msg_send_![class!(NSMenu), new];
+    // Entry for the app menu dropdown in the menu bar
+    let app_menu_item = msg_send_![class!(NSMenuItem), new];
+    let app_menu = msg_send_![class!(NSMenu), new];
+
+    // Hook up the menu components to the application
+    msg_send_![app_menu_item, setSubmenu: app_menu];
+    msg_send_![menu_bar, addItem: app_menu_item];
+    msg_send_![ns_app, setMainMenu: menu_bar];
+
+    // Add quit menu entry with shortcut command-q
+    // It uses NSRunningApplication.localizedName, which will try to use the localized name,
+    //  and will go through a chain of fallbacks based on what name strings are set in
+    //  the Application bundle files, ending with the executable name.
+    let running_application = msg_send_![class!(NSRunningApplication), currentApplication];
+    let application_name = msg_send_![running_application, localizedName];
+    let quit_item_title =
+        str_to_nsstring(&format!("Quit {}", nsstring_to_string(application_name)));
+    let quit_item = msg_send_![class!(NSMenuItem), alloc];
+    let quit_item = msg_send_![
+        quit_item,
+        initWithTitle: quit_item_title
+        action: sel!(terminate:)
+        keyEquivalent: str_to_nsstring("q")
+    ];
+    msg_send_![app_menu, addItem: quit_item];
+}
+
+unsafe fn perform_redraw(
+    display: &mut MacosDisplay,
+    apple_gfx_api: AppleGfxApi,
+    in_draw_rect: bool,
+) {
+    if display.event_handler.is_none() {
+        let f = display.f.take().unwrap();
+        display.event_handler = Some(f());
+    }
+
+    let mut updated = false;
+
+    if let Some(event_handler) = display.context() {
+        event_handler.update();
+        event_handler.draw();
+        updated = true;
+    }
+    if updated {
+        display.update_requested = false;
+    }
+
+    {
+        let d = native_display().lock().unwrap();
+        if d.quit_requested || d.quit_ordered {
+            drop(d);
+            let () = msg_send![display.window, performClose: nil];
+        }
+    }
+    unsafe {
+        // reduce CPU usage hen window is in background
+        if display.occluded {
+            let now = Instant::now();
+            let framerate = 60.0;
+            let period = (1.0 / framerate * 1000.) as u64;
+
+            match Duration::from_millis(period).checked_sub(now - display.last_paint_start_time) {
+                Some(delay) => {
+                    std::thread::sleep(delay);
+                }
+                None => {
+                    display.last_paint_start_time = now;
+                }
+            }
+        }
+        match apple_gfx_api {
+            AppleGfxApi::OpenGl => {
+                msg_send_!(display.gl_context, flushBuffer);
+            }
+            AppleGfxApi::Metal => {
+                if !in_draw_rect {
+                    msg_send_!(display.view, draw);
+                }
+            }
+        };
+    }
+}
+
 pub unsafe fn run<F>(conf: crate::conf::Conf, f: F)
 where
     F: 'static + FnOnce() -> Box<dyn EventHandler>,
@@ -917,7 +1017,9 @@ where
     let mut display = MacosDisplay {
         view: std::ptr::null_mut(),
         window: std::ptr::null_mut(),
+        gl_context: std::ptr::null_mut(),
         fullscreen: false,
+        occluded: false,
         cursor_shown: true,
         current_cursor: CursorIcon::Default,
         cursor_grabbed: false,
@@ -928,6 +1030,7 @@ where
         native_requests: rx,
         modifiers: Modifiers::default(),
         update_requested: true,
+        last_paint_start_time: Instant::now(),
     };
 
     let app_delegate_class = define_app_delegate();
@@ -940,17 +1043,17 @@ where
         setActivationPolicy: NSApplicationActivationPolicy::NSApplicationActivationPolicyRegular
             as i64
     ];
-    let () = msg_send![ns_app, activateIgnoringOtherApps: YES];
 
     if let Some(icon) = &conf.icon {
         set_icon(ns_app, icon);
     }
 
+    initialize_menu_bar(ns_app);
+
     let window_masks = NSWindowStyleMask::NSTitledWindowMask as u64
         | NSWindowStyleMask::NSClosableWindowMask as u64
         | NSWindowStyleMask::NSMiniaturizableWindowMask as u64
         | NSWindowStyleMask::NSResizableWindowMask as u64;
-    //| NSWindowStyleMask::NSFullSizeContentViewWindowMask as u64;
 
     let window_frame = NSRect {
         origin: NSPoint { x: 0., y: 0. },
@@ -983,8 +1086,8 @@ where
     let () = msg_send![window, setAcceptsMouseMovedEvents: YES];
 
     let view = match conf.platform.apple_gfx_api {
-        AppleGfxApi::OpenGl => create_opengl_view(window_frame, conf.sample_count, conf.high_dpi),
-        AppleGfxApi::Metal => create_metal_view(window_frame, conf.sample_count, conf.high_dpi),
+        AppleGfxApi::OpenGl => create_opengl_view(&mut display, conf.sample_count, conf.high_dpi),
+        AppleGfxApi::Metal => create_metal_view(&mut display, conf.sample_count, conf.high_dpi),
     };
     {
         let mut d = native_display().lock().unwrap();
@@ -997,6 +1100,18 @@ where
 
     let () = msg_send![window, setContentView: view];
 
+    // cannot place it to create_opengl_view, because it should be called after setContentView
+    if conf.platform.apple_gfx_api == AppleGfxApi::OpenGl {
+        msg_send_![display.gl_context, setView:view];
+        msg_send_![display.gl_context, makeCurrentContext];
+
+        gl::load_gl_funcs(|proc| {
+            let name = std::ffi::CString::new(proc).unwrap();
+
+            get_proc_address(name.as_ptr() as _)
+        });
+    }
+
     let _ = display.update_dimensions();
 
     assert!(!view.is_null());
@@ -1007,13 +1122,29 @@ where
         let () = msg_send![window, toggleFullScreen: nil];
     }
 
+    msg_send_![window, orderFront: nil];
+    let () = msg_send![ns_app, activateIgnoringOtherApps: YES];
     let () = msg_send![window, makeKeyAndOrderFront: nil];
 
-    let ns_app: ObjcId = msg_send![class!(NSApplication), sharedApplication];
-
-    // Basically reimplementing msg_send![ns_app, run] here
     let () = msg_send![ns_app, finishLaunching];
 
+    // Found this here: https://github.com/kovidgoyal/kitty/issues/6341#issuecomment-1578348104
+    let current_runloop = msg_send_![class!(NSRunLoop), currentRunLoop];
+    let timer = match conf.platform.apple_gfx_api {
+        AppleGfxApi::OpenGl => msg_send_![class!(NSTimer), timerWithTimeInterval:0.016 // ~60FPS
+                                                           target:view
+                                                           selector:sel!(setNeedsDisplayHack)
+                                                           userInfo:nil
+                                                           repeats:YES],
+        AppleGfxApi::Metal => msg_send_![class!(NSTimer), timerWithTimeInterval:0.016 // ~60FPS
+                                                          target:view
+                                                          selector:sel!(draw)
+                                                          userInfo:nil
+                                                          repeats:YES],
+    };
+    msg_send_![current_runloop, addTimer:timer forMode:NSEventTrackingRunLoopMode];
+
+    // Basically reimplementing msg_send![ns_app, run] here
     let distant_future: ObjcId = msg_send![class!(NSDate), distantFuture];
     let distant_past: ObjcId = msg_send![class!(NSDate), distantPast];
     let mut done = false;
@@ -1045,9 +1176,7 @@ where
         }
 
         if !conf.platform.blocking_event_loop || display.update_requested {
-            unsafe {
-                let () = msg_send!(view, setNeedsDisplay: YES);
-            }
+            perform_redraw(&mut display, conf.platform.apple_gfx_api, false);
         }
     }
 }
